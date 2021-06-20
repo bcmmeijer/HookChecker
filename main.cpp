@@ -2,12 +2,28 @@
 #include <iomanip>
 #include <string>
 #include <vector>
-#include <Windows.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+
+#include <Windows.h>
+#include <tlhelp32.h>
+#include <dbghelp.h>
+#include <winternl.h>
+
+#pragma comment(lib, "dbghelp.lib")
+
+
 
 class hookchecker {
 public:
+	enum : uint8_t {
+		hk_all,
+		hk_inline,
+		hk_bp,
+		hk_hwbp,
+		hk_iat,
+	};
 
 	hookchecker(const char* module, const char* function, const std::string& path = "") :
 		_module(module), _function(function), _full_filename(path) {
@@ -40,7 +56,58 @@ public:
 		}
 	}
 
-	bool check() {
+	bool check(uint8_t& type) {
+
+		if (type == hk_all || type == hk_inline) {
+			if (check_inline()) {
+				type = hk_inline;
+				return true;
+			}
+		}
+
+		if (type == hk_all || type == hk_bp) {
+			if (check_bp()) {
+				type = hk_bp;
+				return true;
+			}
+		}
+
+		if (type == hk_all || type == hk_hwbp) {
+			if (check_hwbp()) {
+				type = hk_hwbp;
+				return true;
+			}
+		}
+
+		if (type == hk_all || type == hk_iat) {
+			if (check_iat()) {
+				type = hk_iat;
+				return true;
+			}
+		}
+		
+		return false;
+	}
+
+	bool unhook(uint8_t& type) {
+		
+		if (type == hk_all || type > hk_iat) {
+			std::cout << "unknown type\n";
+			return false;
+		}
+
+		switch (type) {
+		case hk_inline:	return unhook_inline();
+		case hk_bp:		return unhook_bp();
+		case hk_hwbp:	return unhook_hwbp();
+		case hk_iat:	return unhook_iat();
+		default:		return false;
+		}
+	}
+	
+private:
+	bool check_inline() {
+		std::cout << "checking inline hook\n";
 		std::cout << "checking " << _size << " bytes\n";
 
 		if (!_active_function || !_loaded_function) {
@@ -55,7 +122,132 @@ public:
 		return true;
 	}
 
-	bool unhook() {
+	bool check_bp() {
+		std::cout << "checking breakpoint(int3) hook\n";
+
+		if (*(uint8_t*)_active_function == 0xCC) {
+			std::cout << "INT3 instruction found!\n";
+			return true;
+		}
+
+		std::cout << "no INT3 instruction found\n";
+		return false;
+	}
+
+	bool check_hwbp() {
+		std::cout << "checking hardware breakpoint hook\n";
+
+		bool is_hooked = false;
+
+		auto func = [this](HANDLE thread, DWORD pid, DWORD tid) {
+			CONTEXT ctx = { 0 };
+			ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+			if (!GetThreadContext(thread, &ctx)) {
+				std::cout << "could not get thread context for thread " << tid << "\n";
+				return false;
+			}
+
+			for (int i = 0; i < 4; i++) {
+				uintptr_t addr = ((uintptr_t*)&ctx.Dr0)[i];
+				if (addr == (uintptr_t)_active_function) {
+					std::cout << "function found in thread " << tid << " in debug register Dr" << i << "\n";
+					return true;
+				}
+			}
+
+			return false;
+		};
+
+		if (!for_each_thread(func, is_hooked))
+			std::cout << "could not run check for each thread\n";
+
+		return is_hooked;
+	}
+
+	bool check_iat() {
+		std::cout << "checking IAT hook\n";
+
+		uint8_t* base;
+		PIMAGE_DOS_HEADER dos;
+		PIMAGE_NT_HEADERS nt;
+		PIMAGE_IMPORT_DESCRIPTOR	imports, target;
+		PIMAGE_THUNK_DATA			othunk, fthunk;
+		PPEB						peb;
+
+#if 0
+#ifdef _WIN64
+		peb = reinterpret_cast<PTEB>(__readgsqword(reinterpret_cast<DWORD_PTR>(&static_cast<NT_TIB*>(nullptr)->Self)))->ProcessEnvironmentBlock;
+#else
+		peb = reinterpret_cast<PTEB>(__readfsdword(reinterpret_cast<DWORD_PTR>(&static_cast<NT_TIB*>(nullptr)->Self)))->ProcessEnvironmentBlock;
+#endif
+
+		PLDR_DATA_TABLE_ENTRY data = (PLDR_DATA_TABLE_ENTRY)peb->Ldr->InMemoryOrderModuleList.Flink;
+		if (!data || !data->FullDllName.Buffer) {
+			std::cout << "could not get name of current process\n";
+		}
+
+		uint8_t* curmod = (uint8_t*)GetModuleHandleW(data->FullDllName.Buffer);
+#else
+
+		char procname[MAX_PATH] = { 0 };
+		DWORD size = MAX_PATH;
+		QueryFullProcessImageNameA(GetCurrentProcess(), 0, procname, &size);
+
+		uint8_t* curmod = (uint8_t*)GetModuleHandleA(procname);
+#endif
+
+		load_headers(curmod, &dos, &nt, nullptr);
+		base = (uint8_t*)dos;
+
+		imports = (PIMAGE_IMPORT_DESCRIPTOR)ImageDirectoryEntryToDataEx(dos, true, IMAGE_DIRECTORY_ENTRY_IMPORT, &size, nullptr);
+		if (!imports) {
+			std::cout << "could not get the import descriptor from the file headers\n";
+			return false;
+		}
+
+		target = nullptr;
+		while (imports->Name) {
+			char* name = (char*)(base + imports->Name);
+
+			if (!_strcmpi(_module, name) || !(_strcmpi((std::string(_module) + ".dll").c_str(), name))) {
+				target = imports;
+				break;
+			}
+
+			imports++;
+		}
+
+		if (!target) {
+			std::cout << "could not find module in import table\n";
+			return false;
+		}
+
+		othunk = (PIMAGE_THUNK_DATA)(base + target->OriginalFirstThunk);
+		fthunk = (PIMAGE_THUNK_DATA)(base + target->FirstThunk);
+
+		uintptr_t min_addr = (uintptr_t)_active_dos;
+		uintptr_t max_addr = (uintptr_t)_active_dos + _active_nt->OptionalHeader.SizeOfImage;
+
+		while (!(othunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) && othunk->u1.AddressOfData) {
+
+			PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(base + othunk->u1.AddressOfData);
+			if (!strcmp(_function, ibn->Name)) {
+
+				if (min_addr <fthunk->u1.Function && max_addr > fthunk->u1.Function)
+					return false;
+				else
+					return true;
+			}
+
+			othunk++;
+			fthunk++;
+		}
+
+		return false;
+	}
+
+	bool unhook_inline() {
 		std::cout << "recovering " << _size << " bytes\n";
 
 		if (!_active_function || !_loaded_function) {
@@ -81,7 +273,115 @@ public:
 		return true;
 	}
 
+	bool unhook_bp() {
+		std::cout << "unhooking breakpoint (INT3) hook\n";
+
+		DWORD old = 0;
+		if (!VirtualProtect(_active_function, 1, PAGE_EXECUTE_READWRITE, &old)) {
+			std::cout << "could not change page protection to PAGE_EXECUTE_READWRITE\n";
+			return false;
+		}
+
+		*(uint8_t*)_active_function = *(uint8_t*)_loaded_function;
+
+		if (!VirtualProtect(_active_function, 1, old, &old)) {
+			std::cout << "could not revert page protection changes but unhooked anyways. page is now RWX protected\n";
+			return true;
+		}
+
+		return true;
+	}
+
+	bool unhook_hwbp() {
+
+		bool success = false;
+
+		auto func = [this](HANDLE thread, DWORD pid, DWORD tid) {
+
+			CONTEXT ctx = { 0 };
+			ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+			if (!GetThreadContext(thread, &ctx)) {
+				std::cout << "could not get thread context for thread " << tid << "\n";
+				return false;
+			}
+
+			for (int i = 0; i < 4; i++) {
+				uintptr_t& addr = ((uintptr_t*)&ctx.Dr0)[i];
+				if (addr == (uintptr_t)_active_function) {
+					std::cout << "function found in thread " << tid << " in debug register Dr" << i << "\n";
+					std::cout << "erasing register\n";
+
+					addr = 0;
+
+					if (!SetThreadContext(thread, &ctx)) {
+						std::cout << "could not erase register\n";
+						return false;
+					}
+
+					return true;
+				}
+			}
+		};
+
+		if (!for_each_thread(func, success)) {
+			std::cout << "could not run procedure for each thread\n";
+			return success;
+		}
+
+		return success;
+	}
+
+	bool unhook_iat() {
+
+		// get byte pattern of original function
+		// scan loaded module for byte pattern
+		// save found address in iat
+
+		std::cout << "cannot unhook iat (yet)\n";
+		return false;
+	}
+
 private:
+	bool for_each_thread(std::function<bool(HANDLE, DWORD, DWORD)> func, bool& out) {
+
+		HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+		if (snapshot == INVALID_HANDLE_VALUE) {
+			std::cout << "could not get snapshot handle\n";
+			return false;
+		}
+
+		THREADENTRY32 te;
+		te.dwSize = sizeof(te);
+
+		DWORD pid = GetCurrentProcessId();
+		DWORD tid = GetCurrentThreadId();
+
+		if (!Thread32First(snapshot, &te)) {
+			std::cout << "could not get first thread\n";
+			CloseHandle(snapshot);
+			return false;
+		}
+
+		do {
+
+			if (te.th32OwnerProcessID != pid)
+				continue;
+
+			HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, te.th32ThreadID);
+			if (thread == INVALID_HANDLE_VALUE)
+				continue;
+
+			out = func(thread, pid, tid);
+			
+			CloseHandle(thread);
+
+		} while (Thread32Next(snapshot, &te));
+
+		CloseHandle(snapshot);
+
+		return true;
+	}
 
 	bool resolve_functions() {
 
@@ -175,10 +475,11 @@ private:
 		return true;
 	}
 
-	static bool load_headers(uint8_t* data, PIMAGE_DOS_HEADER* dos, PIMAGE_NT_HEADERS* nt, PIMAGE_SECTION_HEADER* sec) {
-		auto& _dos = *dos;
-		auto& _nt = *nt;
-		auto& _sec = *sec;
+	bool load_headers(uint8_t* data, PIMAGE_DOS_HEADER* dos, PIMAGE_NT_HEADERS* nt, PIMAGE_SECTION_HEADER* sec) {
+
+		PIMAGE_DOS_HEADER _dos;
+		PIMAGE_NT_HEADERS _nt;
+		PIMAGE_SECTION_HEADER _sec;
 
 		_dos = (PIMAGE_DOS_HEADER)data;
 		if (_dos->e_magic != IMAGE_DOS_SIGNATURE)
@@ -189,6 +490,10 @@ private:
 			return false;
 
 		_sec = IMAGE_FIRST_SECTION(_nt);
+
+		if (dos) *dos = _dos;
+		if (nt)  *nt = _nt;
+		if (sec) *sec = _sec;
 
 		return true;
 	}
@@ -229,37 +534,38 @@ private:
 	size_t _size = sizeof(void*) == 4 ? 5 : 14;
 };
 
-
 int main() {
+
 
 	// testing on GetUserNameA
 	void* func = GetUserNameA;
-	
+
 	// make page writable
 	DWORD old;
 	VirtualProtect(func, 10, PAGE_EXECUTE_READWRITE, &old);
-	
+
 	// nop first 10 bytes to simulate hook
 	memset(func, 0x90, 10);
 
 	// recover page protection
 	VirtualProtect(func, 10, old, &old);
 
-	// check if function is edited
+	// check if function is editedhookchecker::hk_all
 	hookchecker checker("Advapi32", "GetUserNameA");
 
-	if (checker.check()) {
+	uint8_t type = hookchecker::hk_iat;
+	if (checker.check(type)) {
 		std::cout << "function entry is changed\n";
 
 		// recover original function
-		checker.unhook();
-	
-		// test function
-		char buf[MAX_PATH] = { 0 };
-		DWORD size = MAX_PATH;
-		GetUserNameA(buf, &size);
-		std::cout << buf << "\n";
-	}
+		//checker.unhook(type);
 
+		//// test function
+		//char buf[MAX_PATH] = { 0 };
+		//DWORD size = MAX_PATH;
+		//GetUserNameA(buf, &size);
+		//std::cout << buf << "\n";
+	}
+	
 	return 0;
 }
