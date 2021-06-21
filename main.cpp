@@ -13,8 +13,6 @@
 
 #pragma comment(lib, "dbghelp.lib")
 
-
-
 class hookchecker {
 public:
 	enum : uint8_t {
@@ -58,6 +56,11 @@ public:
 
 	bool check(uint8_t& type) {
 
+		if (type == hk_all || type > hk_iat) {
+			std::cout << "unknown type\n";
+			return false;
+		}
+
 		if (type == hk_all || type == hk_inline) {
 			if (check_inline()) {
 				type = hk_inline;
@@ -85,12 +88,12 @@ public:
 				return true;
 			}
 		}
-		
+
 		return false;
 	}
 
 	bool unhook(uint8_t& type) {
-		
+
 		if (type == hk_all || type > hk_iat) {
 			std::cout << "unknown type\n";
 			return false;
@@ -104,7 +107,7 @@ public:
 		default:		return false;
 		}
 	}
-	
+
 private:
 	bool check_inline() {
 		std::cout << "checking inline hook\n";
@@ -168,63 +171,21 @@ private:
 	bool check_iat() {
 		std::cout << "checking IAT hook\n";
 
-		uint8_t* base;
+		uint8_t* base = get_process_base();
 		PIMAGE_DOS_HEADER dos;
 		PIMAGE_NT_HEADERS nt;
-		PIMAGE_IMPORT_DESCRIPTOR	imports, target;
-		PIMAGE_THUNK_DATA			othunk, fthunk;
-		PPEB						peb;
+		PIMAGE_IMPORT_DESCRIPTOR imports, target;
+		PIMAGE_THUNK_DATA othunk, fthunk;
 
-#if 0
-#ifdef _WIN64
-		peb = reinterpret_cast<PTEB>(__readgsqword(reinterpret_cast<DWORD_PTR>(&static_cast<NT_TIB*>(nullptr)->Self)))->ProcessEnvironmentBlock;
-#else
-		peb = reinterpret_cast<PTEB>(__readfsdword(reinterpret_cast<DWORD_PTR>(&static_cast<NT_TIB*>(nullptr)->Self)))->ProcessEnvironmentBlock;
-#endif
-
-		PLDR_DATA_TABLE_ENTRY data = (PLDR_DATA_TABLE_ENTRY)peb->Ldr->InMemoryOrderModuleList.Flink;
-		if (!data || !data->FullDllName.Buffer) {
-			std::cout << "could not get name of current process\n";
-		}
-
-		uint8_t* curmod = (uint8_t*)GetModuleHandleW(data->FullDllName.Buffer);
-#else
-
-		char procname[MAX_PATH] = { 0 };
-		DWORD size = MAX_PATH;
-		QueryFullProcessImageNameA(GetCurrentProcess(), 0, procname, &size);
-
-		uint8_t* curmod = (uint8_t*)GetModuleHandleA(procname);
-#endif
-
-		load_headers(curmod, &dos, &nt, nullptr);
-		base = (uint8_t*)dos;
-
-		imports = (PIMAGE_IMPORT_DESCRIPTOR)ImageDirectoryEntryToDataEx(dos, true, IMAGE_DIRECTORY_ENTRY_IMPORT, &size, nullptr);
-		if (!imports) {
-			std::cout << "could not get the import descriptor from the file headers\n";
+		if (!load_headers(base, &dos, &nt, nullptr)) {
+			std::cout << "could not load process headers\n";
 			return false;
 		}
 
-		target = nullptr;
-		while (imports->Name) {
-			char* name = (char*)(base + imports->Name);
-
-			if (!_strcmpi(_module, name) || !(_strcmpi((std::string(_module) + ".dll").c_str(), name))) {
-				target = imports;
-				break;
-			}
-
-			imports++;
-		}
-
-		if (!target) {
-			std::cout << "could not find module in import table\n";
+		if (!get_iat_thunks(base, &othunk, &fthunk)) {
+			std::cout << "could not get thunks\n";
 			return false;
 		}
-
-		othunk = (PIMAGE_THUNK_DATA)(base + target->OriginalFirstThunk);
-		fthunk = (PIMAGE_THUNK_DATA)(base + target->FirstThunk);
 
 		uintptr_t min_addr = (uintptr_t)_active_dos;
 		uintptr_t max_addr = (uintptr_t)_active_dos + _active_nt->OptionalHeader.SizeOfImage;
@@ -334,11 +295,60 @@ private:
 
 	bool unhook_iat() {
 
-		// get byte pattern of original function
-		// scan loaded module for byte pattern
-		// save found address in iat
+		uint8_t* base = get_process_base();
+		PIMAGE_DOS_HEADER dos;
+		PIMAGE_NT_HEADERS nt;
+		PIMAGE_IMPORT_DESCRIPTOR imports, target;
+		PIMAGE_THUNK_DATA othunk, fthunk;
 
-		std::cout << "cannot unhook iat (yet)\n";
+		if (!load_headers(base, &dos, &nt, nullptr)) {
+			std::cout << "could not load process headers\n";
+			return false;
+		}
+
+		if (!get_iat_thunks(base, &othunk, &fthunk)) {
+			std::cout << "could not get thunks\n";
+			return false;
+		}
+		
+		uintptr_t min_addr = (uintptr_t)_active_dos;
+		uintptr_t max_addr = (uintptr_t)_active_dos + _active_nt->OptionalHeader.SizeOfImage;
+
+		while (!(othunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) && othunk->u1.AddressOfData) {
+
+			PIMAGE_IMPORT_BY_NAME ibn = (PIMAGE_IMPORT_BY_NAME)(base + othunk->u1.AddressOfData);
+			if (!strcmp(_function, ibn->Name)) {
+
+				std::cout << "function " << std::quoted(_function) << " is pointing at " << fthunk->u1.Function << "\n";
+				std::cout << "scanning for original function address using 20 byte match...\n"; // change this to length disassembled value
+
+				for (uint8_t* addr = (uint8_t*)min_addr; (uintptr_t)addr < max_addr; addr++) {
+					if (!memcmp(addr, _loaded_function, min(max_addr - (uintptr_t)addr, 20))) {
+						std::cout << "original function located at 0x" << (void*)addr << "\n";
+						std::cout << "overwriting iat entry\n";
+
+						DWORD old = 0;
+						if (!VirtualProtect(&fthunk->u1.Function, sizeof(uintptr_t), PAGE_READWRITE, &old)) {
+							std::cout << "could not change page protection to PAGE_READWRITE\n";
+							return false;
+						}
+
+						fthunk->u1.Function = (uintptr_t)addr;
+
+						if (!VirtualProtect(&fthunk->u1.Function, sizeof(uintptr_t), old, &old)) {
+							std::cout << "could not revert page protection changes but unhooked anyways. page is now RW protected\n";
+							return true;
+						}
+
+						return true;
+					}
+				}
+			}
+
+			othunk++;
+			fthunk++;
+		}
+
 		return false;
 	}
 
@@ -373,7 +383,7 @@ private:
 				continue;
 
 			out = func(thread, pid, tid);
-			
+
 			CloseHandle(thread);
 
 		} while (Thread32Next(snapshot, &te));
@@ -406,7 +416,7 @@ private:
 		return true;
 	}
 
-	static void* resolve_function(PIMAGE_DOS_HEADER dos, PIMAGE_NT_HEADERS nt, const char* func) {
+	void* resolve_function(PIMAGE_DOS_HEADER dos, PIMAGE_NT_HEADERS nt, const char* func) {
 		uintptr_t base = (uintptr_t)dos;
 
 		auto exports = rva2real<PIMAGE_EXPORT_DIRECTORY>(dos, nt, nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
@@ -434,7 +444,7 @@ private:
 
 		if (!exists(_module)) {
 			std::cout << "module is no direct path. resolving...\n";
-			
+
 			char modulename[MAX_PATH] = { 0 };
 			if (!GetModuleFileNameA(_active_hmod, modulename, MAX_PATH))
 				return "";
@@ -453,7 +463,7 @@ private:
 				std::cout << "resolved to " << std::quoted(resolved_mod) << "\n";
 				_full_filename = resolved_mod;
 			}
-		}		
+		}
 	}
 
 	bool load_file() {
@@ -516,13 +526,74 @@ private:
 		return T(nullptr);
 	}
 
+	uint8_t* get_process_base() {
+#if 0
+		PPEB						peb;
+#ifdef _WIN64
+		peb = reinterpret_cast<PTEB>(__readgsqword(reinterpret_cast<DWORD_PTR>(&static_cast<NT_TIB*>(nullptr)->Self)))->ProcessEnvironmentBlock;
+#else
+		peb = reinterpret_cast<PTEB>(__readfsdword(reinterpret_cast<DWORD_PTR>(&static_cast<NT_TIB*>(nullptr)->Self)))->ProcessEnvironmentBlock;
+#endif
+
+		PLDR_DATA_TABLE_ENTRY data = (PLDR_DATA_TABLE_ENTRY)peb->Ldr->InMemoryOrderModuleList.Flink;
+		if (!data || !data->FullDllName.Buffer) {
+			std::cout << "could not get name of current process\n";
+		}
+
+		uint8_t* base = (uint8_t*)GetModuleHandleW(data->FullDllName.Buffer);
+#else
+
+		char procname[MAX_PATH] = { 0 };
+		DWORD size = MAX_PATH;
+		QueryFullProcessImageNameA(GetCurrentProcess(), 0, procname, &size);
+
+		uint8_t* base = (uint8_t*)GetModuleHandleA(procname);
+#endif
+
+		return base;
+	}
+
+	bool get_iat_thunks(uint8_t* base, PIMAGE_THUNK_DATA* othunk, PIMAGE_THUNK_DATA* fthunk) {
+
+		DWORD size;
+		PIMAGE_IMPORT_DESCRIPTOR imports, target;
+		
+		imports = (PIMAGE_IMPORT_DESCRIPTOR)ImageDirectoryEntryToDataEx(base, true, IMAGE_DIRECTORY_ENTRY_IMPORT, &size, nullptr);
+		if (!imports) {
+			std::cout << "could not get the import descriptor from the file headers\n";
+			return false;
+		}
+
+		target = nullptr;
+		while (imports->Name) {
+			char* name = (char*)(base + imports->Name);
+
+			if (!_strcmpi(_module, name) || !(_strcmpi((std::string(_module) + ".dll").c_str(), name))) {
+				target = imports;
+				break;
+			}
+
+			imports++;
+	}
+
+		if (!target) {
+			std::cout << "could not find module in import table\n";
+			return false;
+		}
+
+		if (othunk) *othunk = PIMAGE_THUNK_DATA(base + target->OriginalFirstThunk);
+		if (fthunk) *fthunk = PIMAGE_THUNK_DATA(base + target->FirstThunk);
+
+		return true;
+	}
+
 private:
 	const char* _module = nullptr;
 	const char* _function = nullptr;
 
 	HMODULE					_active_hmod = nullptr;
 	PIMAGE_DOS_HEADER		_active_dos = nullptr, _disk_dos = nullptr;
-	PIMAGE_NT_HEADERS		_active_nt = nullptr,  _disk_nt = nullptr;
+	PIMAGE_NT_HEADERS		_active_nt = nullptr, _disk_nt = nullptr;
 	PIMAGE_SECTION_HEADER	_active_sec = nullptr, _disk_sec = nullptr;
 
 	std::vector<uint8_t>	_buffer;
@@ -531,7 +602,7 @@ private:
 	void* _active_function = nullptr;
 	void* _loaded_function = nullptr;
 
-	size_t _size = sizeof(void*) == 4 ? 5 : 14;
+	size_t _size = sizeof(void*) == 4 ? 5 : 14;	// from my expecience minimum inline hook length (bytes) on x86 is 5 and x64 is 14
 };
 
 int main() {
@@ -541,30 +612,30 @@ int main() {
 	void* func = GetUserNameA;
 
 	// make page writable
-	DWORD old;
-	VirtualProtect(func, 10, PAGE_EXECUTE_READWRITE, &old);
+	//DWORD old;
+	//VirtualProtect(func, 10, PAGE_EXECUTE_READWRITE, &old);
 
-	// nop first 10 bytes to simulate hook
-	memset(func, 0x90, 10);
+	//// nop first 10 bytes to simulate hook
+	//memset(func, 0x90, 10);
 
-	// recover page protection
-	VirtualProtect(func, 10, old, &old);
+	//// recover page protection
+	//VirtualProtect(func, 10, old, &old);
 
-	// check if function is editedhookchecker::hk_all
+	// check if function is edited
 	hookchecker checker("Advapi32", "GetUserNameA");
-
 	uint8_t type = hookchecker::hk_iat;
+
 	if (checker.check(type)) {
 		std::cout << "function entry is changed\n";
-
+	
 		// recover original function
-		//checker.unhook(type);
+		checker.unhook(type);
 
-		//// test function
-		//char buf[MAX_PATH] = { 0 };
-		//DWORD size = MAX_PATH;
-		//GetUserNameA(buf, &size);
-		//std::cout << buf << "\n";
+		// test function
+		char buf[MAX_PATH] = { 0 };
+		DWORD size = MAX_PATH;
+		GetUserNameA(buf, &size);
+		std::cout << buf << "\n";
 	}
 	
 	return 0;
